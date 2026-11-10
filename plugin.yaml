@@ -9,7 +9,7 @@ description: >-
 author: Sky
 requires_hermes: ">=0.22.0"
 python_dependencies:
-  - "cryptography>=42,<50"
+  - "cryptography>=42,<51"
 provides_hooks:
   - pre_tool_call
 provides_tools:
