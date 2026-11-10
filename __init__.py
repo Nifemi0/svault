@@ -6,20 +6,33 @@ encrypted at rest and redacted on read, and revealing a single value is a
 human-approved slash command.
 
 Agent private keys live at ~/.svault/agents/<name>.key (0600). Override the
-directory with SVAULT_HOME.
+directory with SVAULT_HOME. A `pre_tool_call` guard blocks the agent's other
+tools (terminal, read_file, ...) from touching that directory.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
+import shlex
 from pathlib import Path
 
 from . import crypto, db
+
+_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# Surfaces where the person typing is at the machine. Reveal/decrypt from a
+# messaging platform would post a secret into a (possibly shared) chat.
+_LOCAL_SURFACES = {"", "cli", "tui", "desktop", "local"}
 
 
 def _vault_dir() -> Path:
     base = Path(os.environ.get("SVAULT_HOME", str(Path.home() / ".svault")))
     (base / "agents").mkdir(parents=True, exist_ok=True)
+    for d in (base, base / "agents"):
+        try:
+            os.chmod(d, 0o700)
+        except OSError:
+            pass
     return base
 
 
@@ -28,19 +41,23 @@ def _agents_dir() -> Path:
 
 
 def _agent_key_path(name: str) -> Path:
+    # Names come from tool arguments; never let one escape the agents dir.
+    if not _NAME_RE.match(name or ""):
+        raise ValueError("agent name must be 1-64 characters: letters, digits, - and _")
     return _agents_dir() / f"{name}.key"
 
 
 def _save_agent_key(name: str, priv) -> bytes:
     path = _agent_key_path(name)
-    if path.exists():
-        raise ValueError(f"agent '{name}' already exists")
     raw = crypto.private_to_bytes(priv)
-    path.write_text(crypto.b64e(raw))
+    # O_EXCL: never overwrite an existing key. Mode 0600 from creation, so the
+    # key is never briefly world-readable (POSIX; Windows uses the user profile ACL).
     try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        raise ValueError(f"agent '{name}' already exists") from None
+    with os.fdopen(fd, "w", encoding="ascii") as f:
+        f.write(crypto.b64e(raw))
     return crypto.public_to_bytes(priv.public_key())
 
 
@@ -69,13 +86,40 @@ def _list_agents() -> list:
     return out
 
 
+# --- Paths ---------------------------------------------------------------
+
+def _session_cwd() -> Path:
+    """The session's working directory. Handlers run in the gateway process,
+    whose own cwd is not the user's, so relative paths resolve against this."""
+    try:
+        from agent.runtime_cwd import resolve_agent_cwd
+        return Path(resolve_agent_cwd())
+    except Exception:  # noqa: BLE001 — standalone/test context, or older Hermes
+        return Path.cwd()
+
+
+def _resolve(path: str) -> Path:
+    p = Path(path).expanduser()
+    return p if p.is_absolute() else _session_cwd() / p
+
+
+def _in_vault(p: Path) -> bool:
+    try:
+        p.resolve().relative_to(_vault_dir().resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def _read_json(p: Path):
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
 # --- Tool handlers -------------------------------------------------------
 
 def _handle_agent_new(params, **kwargs):
     del kwargs
     name = str(params.get("name", "")).strip()
-    if not name or not name.replace("-", "").replace("_", "").isalnum():
-        return json.dumps({"error": "name must be alphanumeric (plus - and _)"})
     try:
         pub = _save_agent_key(name, crypto.generate_keypair()[0])
     except ValueError as e:
@@ -91,24 +135,43 @@ def _handle_agent_list(params, **kwargs):
 def _handle_encrypt(params, **kwargs):
     del kwargs
     path = str(params.get("path", ""))
-    to = params.get("to") or []
+    to = [str(a) for a in (params.get("to") or [])]
+    keep_original = bool(params.get("keep_original", False))
     if not path:
         return json.dumps({"error": "path is required"})
-    p = Path(path)
-    if not p.exists():
+    p = _resolve(path)
+    if not p.is_file():
         return json.dumps({"error": f"file not found: {path}"})
     if not to:
         return json.dumps({"error": "at least one --to agent is required"})
+    if _in_vault(p):
+        return json.dumps({"error": "refusing to operate on the svault key directory"})
+    if p.name.endswith(".svault"):
+        return json.dumps({"error": f"{p.name} is already a svault file"})
+    out = Path(str(p) + ".svault")
+    if out.exists():
+        return json.dumps({"error": f"{out.name} already exists; remove it first"})
     try:
-        agents = [(str(a), _load_agent_public(str(a))) for a in to]
-        doc = crypto.encrypt_bytes(p.read_bytes(), file_name=p.name, agents=agents)
+        agents = [(a, _load_agent_public(a)) for a in to]
+        plaintext = p.read_bytes()
+        doc = crypto.encrypt_bytes(plaintext, file_name=p.name, agents=agents)
+        # Prove the ciphertext decrypts before the plaintext is removed.
+        check = crypto.decrypt_bytes(doc, agent_name=to[0], agent_priv=_load_agent_private(to[0]))
+        if check != plaintext:
+            raise ValueError("round-trip verification failed; original left untouched")
+        crypto.save_doc(doc, out)
+        if not keep_original:
+            p.unlink()
     except Exception as e:  # noqa: BLE001
         return json.dumps({"error": str(e)})
-    out = Path(str(p) + ".svault")
-    crypto.save_doc(doc, out)
     return json.dumps({
         "success": True, "encrypted": str(p), "output": str(out),
-        "recipients": [a for a, _ in agents],
+        "recipients": to,
+        "original_removed": not keep_original,
+        "note": (
+            "The plaintext original was deleted." if not keep_original else
+            "The plaintext original is STILL ON DISK (keep_original=true)."
+        ) + " Copies elsewhere (backups, git history, editor swap files) are not affected.",
     })
 
 
@@ -119,25 +182,39 @@ def _handle_protect_db(params, **kwargs):
     to = [str(a) for a in (params.get("to") or [])]
     if not path or not fields or not to:
         return json.dumps({"error": "path, fields, and to are all required"})
-    p = Path(path)
-    if not p.exists():
+    p = _resolve(path)
+    if not p.is_file():
         return json.dumps({"error": f"file not found: {path}"})
+    if _in_vault(p):
+        return json.dumps({"error": "refusing to operate on the svault key directory"})
     try:
-        data = json.loads(p.read_text())
+        data = _read_json(p)
     except Exception as e:  # noqa: BLE001
         return json.dumps({"error": f"not valid JSON: {e}"})
     try:
-        agents = [(str(a), _load_agent_public(str(a))) for a in to]
+        agents = [(a, _load_agent_public(a)) for a in to]
         n = db.protect(data, fields, agents)
+        left = db.count_plaintext(data, fields)
+        if left:
+            raise ValueError(f"{left} value(s) could not be encrypted; database left untouched")
+        if n:
+            crypto.atomic_write_bytes(
+                p, json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+            )
     except Exception as e:  # noqa: BLE001
         return json.dumps({"error": str(e)})
-    p.write_text(json.dumps(data, indent=2))
     return json.dumps({
         "success": True,
         "encrypted_values": n,
         "fields": sorted(fields),
         "protected_file": str(p),
-        "note": "Sensitive fields are now ciphertext at rest. Read this DB with svault_read_db to see redacted values.",
+        "note": (
+            "Sensitive fields are now ciphertext at rest. Read this DB with svault_read_db to see "
+            "redacted values. Older copies (backups, git history) still hold the plaintext."
+            if n else
+            "No plaintext values were found under those field names (already protected, or the "
+            "field names do not match). Nothing was changed."
+        ),
     })
 
 
@@ -146,14 +223,16 @@ def _handle_read_db(params, **kwargs):
     path = str(params.get("path", ""))
     if not path:
         return json.dumps({"error": "path is required"})
-    p = Path(path)
-    if not p.exists():
+    p = _resolve(path)
+    if not p.is_file():
         return json.dumps({"error": f"file not found: {path}"})
+    if _in_vault(p):
+        return json.dumps({"error": "refusing to operate on the svault key directory"})
     try:
-        data = json.loads(p.read_text())
+        data = _read_json(p)
     except Exception as e:  # noqa: BLE001
         return json.dumps({"error": f"not valid JSON: {e}"})
-    return json.dumps(db.redact(data))
+    return json.dumps(db.redact(data), ensure_ascii=False)
 
 
 def _handle_decrypt(params, **kwargs):
@@ -185,7 +264,7 @@ def _handle_reveal(params, **kwargs):
 def _handle_list(params, **kwargs):
     del kwargs
     d = str(params.get("path", ".")) or "."
-    p = Path(d)
+    p = _resolve(d)
     if not p.is_dir():
         return json.dumps({"error": f"not a directory: {d}"})
     files = []
@@ -199,12 +278,57 @@ def _handle_list(params, **kwargs):
     return json.dumps({"vault_files": files})
 
 
+# --- Key-directory guard -------------------------------------------------
+
+def _guard_needles() -> list:
+    needles = {"/.svault", ".svault/agents", "svault_home"}
+    for candidate in (os.environ.get("SVAULT_HOME"), None):
+        try:
+            base = Path(candidate) if candidate else _vault_dir()
+            needles.add(str(base).replace("\\", "/").lower())
+            needles.add(str(base.resolve()).replace("\\", "/").lower())
+        except OSError:
+            pass
+    return sorted(n for n in needles if n)
+
+
+def _pre_tool_call_guard(tool_name: str = "", args=None, **kwargs):
+    """Veto any non-svault tool call whose arguments mention the key vault.
+
+    Without this, an agent with a terminal or file-read tool could simply read
+    ~/.svault/agents/<name>.key and decrypt everything itself. This is a
+    best-effort string match on the tool arguments (it stops the direct path,
+    not an attacker who obfuscates a shell command) — see the README.
+    """
+    del kwargs
+    if os.environ.get("SVAULT_GUARD", "1").lower() in ("0", "off", "false"):
+        return None
+    if str(tool_name).startswith("svault_"):
+        return None
+    try:
+        blob = json.dumps(args, default=str)
+    except Exception:  # noqa: BLE001
+        blob = str(args)
+    blob = re.sub(r"/+", "/", blob.replace("\\", "/")).lower()
+    for needle in _guard_needles():
+        if needle in blob:
+            return {
+                "action": "block",
+                "message": (
+                    "svault: blocked. This tool call references the svault key directory, which "
+                    "the agent may not read, list, copy or modify. Protected values are revealed "
+                    "only by a human with `/svault reveal`."
+                ),
+            }
+    return None
+
+
 # --- Slash command -------------------------------------------------------
 
 def _decrypt_to(agent: str, src: Path, out: Path) -> None:
     doc = crypto.load_doc(src)
     priv = _load_agent_private(agent)
-    out.write_bytes(crypto.decrypt_bytes(doc, agent_name=agent, agent_priv=priv))
+    crypto.atomic_write_bytes(out, crypto.decrypt_bytes(doc, agent_name=agent, agent_priv=priv))
 
 
 def _strip_svault(p: Path) -> Path:
@@ -212,6 +336,14 @@ def _strip_svault(p: Path) -> Path:
     if name.endswith(".svault"):
         name = name[: -len(".svault")]
     return p.with_name(name)
+
+
+def _split_args(raw: str) -> list:
+    try:
+        parts = shlex.split(raw, posix=(os.name != "nt"))
+    except ValueError:
+        parts = raw.split()
+    return [p[1:-1] if len(p) >= 2 and p[0] == p[-1] and p[0] in "\"'" else p for p in parts]
 
 
 def register(ctx):
@@ -244,17 +376,18 @@ def register(ctx):
     )
     _tool(
         "svault_encrypt",
-        "Encrypt an entire file to one or more svault agents. Writes a .svault file beside the original. The agent cannot decrypt it back.",
+        "Encrypt an entire file to one or more svault agents. Writes a .svault file beside the original and, once the ciphertext is verified, deletes the plaintext original. The agent cannot decrypt it back.",
         {
             "path": {"type": "string", "description": "Path to the file to encrypt"},
             "to": {"type": "array", "items": {"type": "string"}, "description": "Agent names to encrypt to"},
+            "keep_original": {"type": "boolean", "description": "Leave the plaintext original on disk (default false: it is deleted)"},
         },
         ["path", "to"],
         _handle_encrypt,
     )
     _tool(
         "svault_protect_db",
-        "Protect sensitive fields in a JSON database: encrypt each named field's value in place (at rest). The agent can still read the DB with svault_read_db but sees redacted values for those fields. Returns how many values were encrypted.",
+        "Protect sensitive fields in a JSON database: encrypt each named field's value in place (at rest), whatever its type. The agent can still read the DB with svault_read_db but sees redacted values for those fields. Safe to run again. Returns how many values were encrypted.",
         {
             "path": {"type": "string", "description": "Path to the JSON database"},
             "fields": {"type": "array", "items": {"type": "string"}, "description": "Sensitive field names to encrypt (e.g. solPrivateKey, apiKey)"},
@@ -300,9 +433,15 @@ def register(ctx):
         _handle_list,
     )
 
+    # Keep the agent's other tools out of the key directory.
+    try:
+        ctx.register_hook("pre_tool_call", _pre_tool_call_guard)
+    except Exception:  # noqa: BLE001 — hooks unavailable; tools still work
+        pass
+
     def _svault_cmd(raw_args: str, **session_kw) -> str:
-        del session_kw
-        parts = raw_args.strip().split()
+        platform = str(session_kw.get("platform") or "").lower()
+        parts = _split_args(raw_args.strip())
         if not parts:
             return (
                 "svault — field-level secrets protection\n"
@@ -325,7 +464,7 @@ def register(ctx):
         if sub == "list":
             d = parts[1] if len(parts) > 1 else "."
             files = []
-            for f in sorted(Path(d).glob("*.svault")):
+            for f in sorted(_resolve(d).glob("*.svault")):
                 try:
                     doc = crypto.load_doc(f)
                     recips = ", ".join(
@@ -338,6 +477,12 @@ def register(ctx):
             return "Vault files:\n" + "\n".join(files) if files else "No .svault files found."
 
         if sub in ("decrypt", "reveal"):
+            if platform not in _LOCAL_SURFACES and os.environ.get("SVAULT_ALLOW_REMOTE_REVEAL") != "1":
+                return (
+                    f"/svault {sub} is only available from a local session (CLI, TUI, Desktop), "
+                    f"not from {platform}: the secret would be posted into this chat. "
+                    "Set SVAULT_ALLOW_REMOTE_REVEAL=1 on the gateway to override."
+                )
             rest = parts[1:]
             agent = None
             positional = []
@@ -353,9 +498,14 @@ def register(ctx):
             if sub == "decrypt":
                 if not positional:
                     return "Usage: /svault decrypt <file.svault> [--agent <name>]"
-                src = Path(positional[0])
-                if not src.exists():
+                src = _resolve(positional[0])
+                if not src.is_file():
                     return f"File not found: {positional[0]}"
+                out = _strip_svault(src)
+                if out == src:
+                    return f"{src.name} does not end in .svault."
+                if out.exists():
+                    return f"{out.name} already exists; move it away first. Nothing was overwritten."
                 if not agent:
                     try:
                         doc = crypto.load_doc(src)
@@ -372,31 +522,34 @@ def register(ctx):
                 )
                 if choice != "Approve":
                     return "Decryption denied."
-                out = _strip_svault(src)
                 try:
                     _decrypt_to(agent, src, out)
                 except Exception as e:  # noqa: BLE001
                     return f"Decryption failed: {e}"
-                return f"Decrypted {src.name} -> {out.name}"
+                return (
+                    f"Decrypted {src.name} -> {out.name}\n"
+                    f"Note: {out.name} is plaintext on disk again, where the agent can read it."
+                )
 
             # reveal
             if len(positional) < 3:
                 return "Usage: /svault reveal <db> <record> <field> [--agent <name>]"
             dbpath, record, field = positional[0], positional[1], positional[2]
-            p = Path(dbpath)
-            if not p.exists():
+            p = _resolve(dbpath)
+            if not p.is_file():
                 return f"File not found: {dbpath}"
             try:
-                data = json.loads(p.read_text())
+                data = _read_json(p)
             except Exception as e:  # noqa: BLE001
                 return f"Not valid JSON: {e}"
             if not agent:
-                rec = data.get(record) if isinstance(data, dict) else None
-                if isinstance(rec, dict) and isinstance(rec.get(field), dict) and "__svault_enc__" in rec[field]:
-                    marker = rec[field]["__svault_enc__"]
+                try:
+                    blob = db.get_marker(data, record, field)
                     agent = next(
-                        (r["agent"] for r in marker["recipients"] if r["type"] == "agent"), None
+                        (r["agent"] for r in blob["recipients"] if r["type"] == "agent"), None
                     )
+                except Exception as e:  # noqa: BLE001
+                    return f"Reveal failed: {e}"
                 if not agent:
                     return "Could not determine an agent for this field. Pass --agent <name>."
             choice = ctx.ask_choice(

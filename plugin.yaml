@@ -1,6 +1,6 @@
 name: svault
 kind: standalone
-version: "1.0.0"
+version: "1.1.0"
 description: >-
   Field-level secrets protection: encrypt the sensitive fields in a database
   at rest, redact them automatically when the agent reads it, and reveal a
@@ -9,7 +9,9 @@ description: >-
 author: Sky
 requires_hermes: ">=0.22.0"
 python_dependencies:
-  - cryptography
+  - "cryptography>=42,<51"
+provides_hooks:
+  - pre_tool_call
 provides_tools:
   - svault_agent_new
   - svault_agent_list

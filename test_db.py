@@ -47,4 +47,32 @@ try:
 except Exception:
     check("wrong key rejected", True)
 
+print("5. secrets of any shape are encrypted, never skipped")
+shaped = {
+    "a": {"apiKey": {"id": "k1", "secret": "NESTED_SECRET"}},
+    "b": {"apiKey": ["LIST_SECRET_1", "LIST_SECRET_2"]},
+    "c": {"apiKey": None},
+    "d": [{"apiKey": 12345}],
+}
+n = db.protect(shaped, {"apiKey"}, agents)
+check("4 values encrypted (object, list, null, number)", n == 4)
+check("no plaintext left", "SECRET" not in json.dumps(shaped))
+check("count_plaintext reports none left", db.count_plaintext(shaped, {"apiKey"}) == 0)
+check("object round-trips", db.reveal(shaped, "a", "apiKey", "admin", priv) == {"id": "k1", "secret": "NESTED_SECRET"})
+check("list round-trips", db.reveal(shaped, "b", "apiKey", "admin", priv) == ["LIST_SECRET_1", "LIST_SECRET_2"])
+check("list-indexed record round-trips", db.reveal(shaped["d"], "0", "apiKey", "admin", priv) == 12345)
+
+print("6. protect is idempotent")
+before = json.dumps(shaped)
+check("second run encrypts nothing", db.protect(shaped, {"apiKey", "file", "nonce", "ciphertext"}, agents) == 0)
+check("envelopes are not re-encrypted or corrupted", json.dumps(shaped) == before)
+
+print("7. a ciphertext cannot be moved to another field")
+shaped["a"]["other"] = shaped["a"]["apiKey"]
+try:
+    db.reveal(shaped, "a", "other", "admin", priv)
+    check("moved ciphertext rejected", False)
+except ValueError:
+    check("moved ciphertext rejected", True)
+
 print("\nALL DB PROTECTION TESTS PASSED")

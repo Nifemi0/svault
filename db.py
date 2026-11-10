@@ -17,20 +17,30 @@ MARKER_KEY = "__svault_enc__"
 REDACTED = "••• REDACTED •••"
 
 
-def _is_scalar(v) -> bool:
-    return isinstance(v, (str, int, float, bool)) or v is None
+def is_marker(v) -> bool:
+    """True for an already-encrypted value: ``{"__svault_enc__": {...}}``."""
+    return isinstance(v, dict) and MARKER_KEY in v
 
 
 def protect(obj, fields: set, agents) -> int:
     """Encrypt every value under a sensitive field name, in place.
 
+    Any JSON value is encrypted whole — strings and numbers, but also nested
+    objects and arrays, so a secret is never silently left in plaintext
+    because of its shape. Values that are already encrypted are left alone,
+    which makes protect() safe to run again on the same database.
+
     Returns the number of values encrypted.
     """
     count = 0
     if isinstance(obj, dict):
+        if is_marker(obj):
+            return 0
         for k in list(obj.keys()):
             v = obj[k]
-            if k in fields and _is_scalar(v):
+            if is_marker(v):
+                continue
+            if k in fields:
                 blob = crypto.encrypt_bytes(
                     json.dumps(v).encode("utf-8"),
                     file_name=k,
@@ -46,6 +56,22 @@ def protect(obj, fields: set, agents) -> int:
     return count
 
 
+def count_plaintext(obj, fields: set) -> int:
+    """Count values under a sensitive field name that are NOT encrypted."""
+    count = 0
+    if isinstance(obj, dict):
+        if is_marker(obj):
+            return 0
+        for k, v in obj.items():
+            if is_marker(v):
+                continue
+            count += 1 if k in fields else count_plaintext(v, fields)
+    elif isinstance(obj, list):
+        for v in obj:
+            count += count_plaintext(v, fields)
+    return count
+
+
 def redact(obj):
     """Return a deep copy with every encrypted value replaced by a redaction marker."""
     if isinstance(obj, dict):
@@ -57,8 +83,8 @@ def redact(obj):
     return obj
 
 
-def reveal(obj, record_key, field, agent_name, agent_priv):
-    """Decrypt the single encrypted value at obj[record_key][field]."""
+def get_marker(obj, record_key, field) -> dict:
+    """Return the encrypted envelope stored at obj[record_key][field]."""
     if isinstance(obj, dict):
         record = obj.get(record_key)
     elif isinstance(obj, list):
@@ -73,11 +99,20 @@ def reveal(obj, record_key, field, agent_name, agent_priv):
         raise ValueError(f"field '{field}' not found in record '{record_key}'")
 
     marker = record[field]
-    if not (isinstance(marker, dict) and MARKER_KEY in marker):
+    if not is_marker(marker) or not isinstance(marker[MARKER_KEY], dict):
         raise ValueError(f"field '{field}' is not encrypted")
+    return marker[MARKER_KEY]
 
+
+def reveal(obj, record_key, field, agent_name, agent_priv):
+    """Decrypt the single encrypted value at obj[record_key][field]."""
+    blob = get_marker(obj, record_key, field)
+    # The envelope records which field it was sealed for (authenticated in
+    # format v2), so a ciphertext moved under another field name is refused.
+    if blob.get("file") != field:
+        raise ValueError(f"encrypted value was not sealed for field '{field}'")
     plain = crypto.decrypt_bytes(
-        marker[MARKER_KEY],
+        blob,
         agent_name=agent_name,
         agent_priv=agent_priv,
     )
