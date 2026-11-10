@@ -1,0 +1,21 @@
+name: svault
+kind: standalone
+version: "1.0.0"
+description: >-
+  Field-level secrets protection: encrypt the sensitive fields in a database
+  at rest, redact them automatically when the agent reads it, and reveal a
+  single value only with human approval. The agent can use the data but never
+  see the secrets.
+author: Sky
+requires_hermes: ">=0.22.0"
+python_dependencies:
+  - cryptography
+provides_tools:
+  - svault_agent_new
+  - svault_agent_list
+  - svault_encrypt
+  - svault_protect_db
+  - svault_read_db
+  - svault_decrypt
+  - svault_reveal
+  - svault_list
