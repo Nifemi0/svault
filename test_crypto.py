@@ -58,4 +58,54 @@ s = json.dumps(doc)
 check("plaintext NOT present in vault doc", b"solPrivateKey" not in s.encode())
 check("ciphertext IS present", "ciphertext" in s)
 
+print("6. header is authenticated (format v2)")
+check("new documents are v2", doc["version"] == 2)
+for key, value in (("file", "other.json"), ("created", doc["created"] + 1)):
+    forged = dict(doc)
+    forged[key] = value
+    try:
+        decrypt_bytes(forged, agent_name="admin", agent_priv=priv_a)
+        check(f"edited '{key}' rejected", False)
+    except Exception:
+        check(f"edited '{key}' rejected", True)
+forged = json.loads(json.dumps(doc))
+forged["recipients"].append({"type": "agent", "agent": "mallory", "epk": "", "nonce": "", "wrapped_dek": ""})
+try:
+    decrypt_bytes(forged, agent_name="admin", agent_priv=priv_a)
+    check("added recipient rejected", False)
+except Exception:
+    check("added recipient rejected", True)
+try:
+    decrypt_bytes(dict(doc, version=99), agent_name="admin", agent_priv=priv_a)
+    check("unknown version rejected", False)
+except ValueError:
+    check("unknown version rejected", True)
+
+print("7. v1 documents (no AAD, scrypt n=2^14) still decrypt")
+import crypto as c
+
+dek = c.random(32)
+epk, wn, wrapped = c.wrap_dek_for_agent(dek, pub_a)
+salt = c.random(16)
+pn, pwrapped = c._seal(c.scrypt_key("old pass", salt, 2**14, 8, 1), dek)
+bn, body = c._seal(dek, plaintext)
+v1 = {
+    "magic": "SVAULT", "version": 1, "file": "db.json", "created": 1,
+    "recipients": [
+        {"type": "agent", "agent": "admin", "epk": c.b64e(epk), "nonce": c.b64e(wn), "wrapped_dek": c.b64e(wrapped)},
+        {"type": "passphrase", "salt": c.b64e(salt), "n": 2**14, "r": 8, "p": 1, "nonce": c.b64e(pn), "wrapped_dek": c.b64e(pwrapped)},
+    ],
+    "nonce": c.b64e(bn), "ciphertext": c.b64e(body),
+}
+check("v1 agent decrypt", decrypt_bytes(v1, agent_name="admin", agent_priv=priv_a) == plaintext)
+check("v1 passphrase decrypt", decrypt_bytes(v1, passphrase="old pass") == plaintext)
+check("stored scrypt parameters are recorded", doc2["recipients"][0]["n"] == c.SCRYPT_N)
+huge = json.loads(json.dumps(doc2))
+huge["recipients"][0]["n"] = 2**30
+try:
+    decrypt_bytes(huge, passphrase="correct horse battery staple")
+    check("absurd scrypt cost rejected", False)
+except ValueError:
+    check("absurd scrypt cost rejected", True)
+
 print("\nALL CRYPTO TESTS PASSED")

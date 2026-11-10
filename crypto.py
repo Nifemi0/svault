@@ -10,11 +10,15 @@ Design (envelope encryption):
   2. Per agent: an ephemeral X25519 key does ECDH with the agent's static
      public key -> HKDF-SHA256 -> wrapping key -> AES-256-GCM wraps the DEK.
   3. Optional passphrase recipient: Scrypt (memory-hard KDF) -> wrapping key.
+  4. Format v2 authenticates the whole header (file name, recipients, ...) as
+     AES-GCM associated data, so the envelope metadata cannot be edited
+     without decryption failing. v1 documents (no AAD) still decrypt.
 """
 from __future__ import annotations
 
 import base64
 import json
+import os
 import time
 
 from cryptography.hazmat.primitives import hashes, serialization
@@ -24,13 +28,16 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 
 MAGIC = "SVAULT"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
+SUPPORTED_VERSIONS = (1, 2)
 NONCE_LEN = 12  # AES-GCM standard nonce length
 DEK_LEN = 32
 HKDF_INFO = b"svault-v1-dek-wrap"
-SCRYPT_N = 2**14  # 16 MiB
+SCRYPT_N = 2**17  # ~128 MiB; the parameters used are stored per recipient
 SCRYPT_R = 8
 SCRYPT_P = 1
+SCRYPT_MAX_N = 2**20  # refuse absurd stored parameters (memory DoS)
+_BODY_KEYS = ("nonce", "ciphertext")  # everything else is authenticated header
 
 
 def b64e(b: bytes) -> str:
@@ -42,7 +49,7 @@ def b64d(s: str) -> bytes:
 
 
 def random(n: int) -> bytes:
-    return __import__("os").urandom(n)
+    return os.urandom(n)
 
 
 # --- X25519 agent keys ---------------------------------------------------
@@ -87,26 +94,39 @@ def _hkdf(ikm: bytes, info: bytes, length: int = 32) -> bytes:
     ).derive(ikm)
 
 
-def scrypt_key(passphrase: str, salt: bytes) -> bytes:
+def scrypt_key(passphrase: str, salt: bytes, n: int = SCRYPT_N, r: int = SCRYPT_R,
+               p: int = SCRYPT_P) -> bytes:
+    if not (isinstance(n, int) and 2 <= n <= SCRYPT_MAX_N and n & (n - 1) == 0):
+        raise ValueError("unsupported scrypt n")
+    if not (isinstance(r, int) and 1 <= r <= 32 and isinstance(p, int) and 1 <= p <= 16):
+        raise ValueError("unsupported scrypt r/p")
     return Scrypt(
         salt=salt,
         length=32,
-        n=SCRYPT_N,
-        r=SCRYPT_R,
-        p=SCRYPT_P,
+        n=n,
+        r=r,
+        p=p,
     ).derive(passphrase.encode("utf-8"))
 
 
 # --- AEAD helpers --------------------------------------------------------
 
-def _seal(key: bytes, plaintext: bytes):
+def _seal(key: bytes, plaintext: bytes, aad: bytes | None = None):
     nonce = random(NONCE_LEN)
-    ct = AESGCM(key).encrypt(nonce, plaintext, None)
+    ct = AESGCM(key).encrypt(nonce, plaintext, aad)
     return nonce, ct
 
 
-def _open(key: bytes, nonce: bytes, ct: bytes) -> bytes:
-    return AESGCM(key).decrypt(nonce, ct, None)
+def _open(key: bytes, nonce: bytes, ct: bytes, aad: bytes | None = None) -> bytes:
+    return AESGCM(key).decrypt(nonce, ct, aad)
+
+
+def _header_aad(doc: dict) -> bytes | None:
+    """Canonical bytes of every header field, bound to the body as GCM AAD (v2+)."""
+    if doc.get("version") == 1:
+        return None
+    header = {k: v for k, v in doc.items() if k not in _BODY_KEYS}
+    return json.dumps(header, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
 # --- Envelope ------------------------------------------------------------
@@ -135,8 +155,9 @@ def wrap_dek_for_passphrase(dek: bytes, passphrase: str):
     return salt, nonce, wrapped
 
 
-def unwrap_dek_for_passphrase(passphrase: str, salt: bytes, nonce: bytes, wrapped: bytes) -> bytes:
-    wrap_key = scrypt_key(passphrase, salt)
+def unwrap_dek_for_passphrase(passphrase: str, salt: bytes, nonce: bytes, wrapped: bytes,
+                              n: int = SCRYPT_N, r: int = SCRYPT_R, p: int = SCRYPT_P) -> bytes:
+    wrap_key = scrypt_key(passphrase, salt, n, r, p)
     return _open(wrap_key, nonce, wrapped)
 
 
@@ -173,29 +194,34 @@ def encrypt_bytes(plaintext: bytes, *, file_name: str, agents=None, passphrase=N
             "wrapped_dek": b64e(wrapped),
         })
 
-    nonce, ct = _seal(dek, plaintext)
-    return {
+    doc = {
         "magic": MAGIC,
         "version": FORMAT_VERSION,
         "file": file_name,
         "created": int(time.time()),
         "recipients": recipients,
-        "nonce": b64e(nonce),
-        "ciphertext": b64e(ct),
     }
+    nonce, ct = _seal(dek, plaintext, _header_aad(doc))
+    doc["nonce"] = b64e(nonce)
+    doc["ciphertext"] = b64e(ct)
+    return doc
 
 
 def decrypt_bytes(doc: dict, *, agent_name=None, agent_priv=None, passphrase=None) -> bytes:
     """Decrypt an svault document with an agent private key or a passphrase."""
-    if doc.get("magic") != MAGIC:
+    if not isinstance(doc, dict) or doc.get("magic") != MAGIC:
         raise ValueError("not a svault file (bad magic)")
+    if doc.get("version") not in SUPPORTED_VERSIONS:
+        raise ValueError(f"unsupported svault format version: {doc.get('version')!r}")
 
     dek = None
     if passphrase is not None:
         for r in doc["recipients"]:
             if r["type"] == "passphrase":
+                # v1 files were always written with n=2**14, r=8, p=1.
                 dek = unwrap_dek_for_passphrase(
-                    passphrase, b64d(r["salt"]), b64d(r["nonce"]), b64d(r["wrapped_dek"])
+                    passphrase, b64d(r["salt"]), b64d(r["nonce"]), b64d(r["wrapped_dek"]),
+                    n=r.get("n", 2**14), r=r.get("r", 8), p=r.get("p", 1),
                 )
                 break
         if dek is None:
@@ -212,7 +238,7 @@ def decrypt_bytes(doc: dict, *, agent_name=None, agent_priv=None, passphrase=Non
     else:
         raise ValueError("decrypt requires an agent key or a passphrase")
 
-    return _open(dek, b64d(doc["nonce"]), b64d(doc["ciphertext"]))
+    return _open(dek, b64d(doc["nonce"]), b64d(doc["ciphertext"]), _header_aad(doc))
 
 
 def load_doc(path) -> dict:
@@ -220,6 +246,24 @@ def load_doc(path) -> dict:
         return json.load(f)
 
 
+def atomic_write_bytes(path, data: bytes) -> None:
+    """Write via a temp file in the same directory + os.replace, so a crash
+    mid-write never leaves a half-written (corrupt) file behind."""
+    path = os.fspath(path)
+    tmp = f"{path}.svault-tmp-{os.getpid()}"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def save_doc(doc: dict, path) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(doc, f, indent=2)
+    atomic_write_bytes(path, json.dumps(doc, indent=2).encode("utf-8"))
