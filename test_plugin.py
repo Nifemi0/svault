@@ -89,12 +89,12 @@ check("no file escaped the agents dir", not (VAULT / "evil.key").exists())
 listed = tool("svault_agent_list")["agents"]
 check("list shows public key only", listed == [{"name": "admin", "public_key": r["public_key"]}])
 
-print("3. whole-file encryption removes the plaintext")
+print("3. whole-file encryption")
 env = WORK / ".env"
 env.write_text("API_TOKEN=sk-live-TOPSECRET\n")
 r = tool("svault_encrypt", path=".env", to=["admin"])
 check("encrypt succeeded (relative path)", r.get("success") is True)
-check("plaintext original deleted", not env.exists() and r["original_removed"] is True)
+check("plaintext kept by default", env.exists() and r["original_removed"] is False)
 check(".svault written", (WORK / ".env.svault").is_file())
 check("no plaintext in .svault", "TOPSECRET" not in (WORK / ".env.svault").read_text())
 cookies = WORK / "cookies.txt"

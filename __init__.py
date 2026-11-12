@@ -5,9 +5,10 @@ agent can READ the data but never SEE the secrets: sensitive values are
 encrypted at rest and redacted on read, and revealing a single value is a
 human-approved slash command.
 
-Agent private keys live at ~/.svault/agents/<name>.key (0600). Override the
-directory with SVAULT_HOME. A `pre_tool_call` guard blocks the agent's other
-tools (terminal, read_file, ...) from touching that directory.
+Agent private keys live under Hermes's per-profile plugin-data directory
+(`<HERMES_HOME>/plugin-data/svault/agents`, 0600). A `pre_tool_call` guard
+blocks the agent's other tools (terminal, read_file, ...) from touching that
+directory, and every tool refuses paths Hermes core itself refuses.
 """
 from __future__ import annotations
 
@@ -24,9 +25,33 @@ _NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 # messaging platform would post a secret into a (possibly shared) chat.
 _LOCAL_SURFACES = {"", "cli", "tui", "desktop", "local"}
 
+_CTX = None
+
+
+def _cfg(key: str, default):
+    """Read a plugin setting from Hermes config (ctx.get_config), with an env
+    fallback for standalone/test contexts."""
+    if _CTX is not None:
+        try:
+            return _CTX.get_config(key, default=default)
+        except Exception:  # noqa: BLE001
+            pass
+    env_map = {"guard": "SVAULT_GUARD", "allow_remote_reveal": "SVAULT_ALLOW_REMOTE_REVEAL"}
+    env = env_map.get(key)
+    if env and env in os.environ:
+        v = os.environ[env].strip()
+        if isinstance(default, bool):
+            return v.lower() not in ("", "0", "off", "false", "no")
+        return v
+    return default
+
 
 def _vault_dir() -> Path:
-    base = Path(os.environ.get("SVAULT_HOME", str(Path.home() / ".svault")))
+    try:
+        from hermes_constants import get_hermes_home
+        base = Path(get_hermes_home()) / "plugin-data" / "svault"
+    except Exception:  # noqa: BLE001 — standalone/test context
+        base = Path(os.environ.get("SVAULT_HOME", str(Path.home() / ".svault")))
     (base / "agents").mkdir(parents=True, exist_ok=True)
     for d in (base, base / "agents"):
         try:
@@ -111,6 +136,50 @@ def _in_vault(p: Path) -> bool:
         return False
 
 
+def _hermes_home():
+    try:
+        from hermes_constants import get_hermes_home
+        return Path(get_hermes_home())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _session_root():
+    try:
+        from agent.runtime_cwd import resolve_agent_cwd
+        root = resolve_agent_cwd()
+        return Path(root) if root else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _guard_path(p: Path, *, write: bool):
+    """Refuse paths Hermes itself refuses: its own home and anything outside the
+    session working directory. Uses only public plugin APIs (`hermes_constants`,
+    `agent.runtime_cwd`)."""
+    del write
+    if _in_vault(p):
+        return "refusing to operate on the svault key directory"
+    try:
+        rp = p.resolve()
+    except OSError:
+        return "cannot resolve path"
+    home = _hermes_home()
+    if home is not None:
+        try:
+            rp.relative_to(home.resolve())
+            return "refusing to operate on Hermes's own files (config, credentials, state)"
+        except ValueError:
+            pass
+    root = _session_root()
+    if root is not None:
+        try:
+            rp.relative_to(root.resolve())
+        except ValueError:
+            return "refusing to operate outside the session working directory"
+    return None
+
+
 def _read_json(p: Path):
     return json.loads(p.read_text(encoding="utf-8"))
 
@@ -136,7 +205,7 @@ def _handle_encrypt(params, **kwargs):
     del kwargs
     path = str(params.get("path", ""))
     to = [str(a) for a in (params.get("to") or [])]
-    keep_original = bool(params.get("keep_original", False))
+    keep_original = bool(params.get("keep_original", True))
     if not path:
         return json.dumps({"error": "path is required"})
     p = _resolve(path)
@@ -144,8 +213,8 @@ def _handle_encrypt(params, **kwargs):
         return json.dumps({"error": f"file not found: {path}"})
     if not to:
         return json.dumps({"error": "at least one --to agent is required"})
-    if _in_vault(p):
-        return json.dumps({"error": "refusing to operate on the svault key directory"})
+    if err := _guard_path(p, write=True):
+        return json.dumps({"error": err})
     if p.name.endswith(".svault"):
         return json.dumps({"error": f"{p.name} is already a svault file"})
     out = Path(str(p) + ".svault")
@@ -185,8 +254,8 @@ def _handle_protect_db(params, **kwargs):
     p = _resolve(path)
     if not p.is_file():
         return json.dumps({"error": f"file not found: {path}"})
-    if _in_vault(p):
-        return json.dumps({"error": "refusing to operate on the svault key directory"})
+    if err := _guard_path(p, write=True):
+        return json.dumps({"error": err})
     try:
         data = _read_json(p)
     except Exception as e:  # noqa: BLE001
@@ -226,8 +295,8 @@ def _handle_read_db(params, **kwargs):
     p = _resolve(path)
     if not p.is_file():
         return json.dumps({"error": f"file not found: {path}"})
-    if _in_vault(p):
-        return json.dumps({"error": "refusing to operate on the svault key directory"})
+    if err := _guard_path(p, write=True):
+        return json.dumps({"error": err})
     try:
         data = _read_json(p)
     except Exception as e:  # noqa: BLE001
@@ -282,13 +351,12 @@ def _handle_list(params, **kwargs):
 
 def _guard_needles() -> list:
     needles = {"/.svault", ".svault/agents", "svault_home"}
-    for candidate in (os.environ.get("SVAULT_HOME"), None):
-        try:
-            base = Path(candidate) if candidate else _vault_dir()
-            needles.add(str(base).replace("\\", "/").lower())
-            needles.add(str(base.resolve()).replace("\\", "/").lower())
-        except OSError:
-            pass
+    try:
+        base = _vault_dir()
+        needles.add(str(base).replace("\\", "/").lower())
+        needles.add(str(base.resolve()).replace("\\", "/").lower())
+    except OSError:
+        pass
     return sorted(n for n in needles if n)
 
 
@@ -301,8 +369,16 @@ def _pre_tool_call_guard(tool_name: str = "", args=None, **kwargs):
     not an attacker who obfuscates a shell command) — see the README.
     """
     del kwargs
-    if os.environ.get("SVAULT_GUARD", "1").lower() in ("0", "off", "false"):
+    if _cfg("guard", True) is False:
         return None
+    if tool_name == "svault_encrypt" and isinstance(args, dict) and not args.get("keep_original", True):
+        return {
+            "action": "approve",
+            "message": (
+                f"svault_encrypt will delete the plaintext original ({args.get('path', '')}). "
+                "Approve the deletion?"
+            ),
+        }
     if str(tool_name).startswith("svault_"):
         return None
     try:
@@ -347,6 +423,8 @@ def _split_args(raw: str) -> list:
 
 
 def register(ctx):
+    global _CTX
+    _CTX = ctx
     ts = "svault"
 
     def _tool(name, description, props, required, handler):
@@ -380,7 +458,7 @@ def register(ctx):
         {
             "path": {"type": "string", "description": "Path to the file to encrypt"},
             "to": {"type": "array", "items": {"type": "string"}, "description": "Agent names to encrypt to"},
-            "keep_original": {"type": "boolean", "description": "Leave the plaintext original on disk (default false: it is deleted)"},
+            "keep_original": {"type": "boolean", "description": "Leave the plaintext original on disk (default true). Setting false deletes it, which requires human approval"},
         },
         ["path", "to"],
         _handle_encrypt,
@@ -477,11 +555,11 @@ def register(ctx):
             return "Vault files:\n" + "\n".join(files) if files else "No .svault files found."
 
         if sub in ("decrypt", "reveal"):
-            if platform not in _LOCAL_SURFACES and os.environ.get("SVAULT_ALLOW_REMOTE_REVEAL") != "1":
+            if platform not in _LOCAL_SURFACES and not _cfg("allow_remote_reveal", False):
                 return (
                     f"/svault {sub} is only available from a local session (CLI, TUI, Desktop), "
                     f"not from {platform}: the secret would be posted into this chat. "
-                    "Set SVAULT_ALLOW_REMOTE_REVEAL=1 on the gateway to override."
+                    "Enable the svault 'allow_remote_reveal' setting to override."
                 )
             rest = parts[1:]
             agent = None
