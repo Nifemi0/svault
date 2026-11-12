@@ -171,13 +171,13 @@ check("edited envelope header refused", cmd("reveal tampered.json 504006010 solP
 
 print("8. /svault decrypt")
 # env still exists (keep_original default true) — decrypt must refuse to overwrite
-check("existing file never overwritten", "already exists" in cmd("decrypt .env.svault") and env.read_text() == "API_TOKEN=***\n")
+check("existing file never overwritten", "already exists" in cmd("decrypt .env.svault") and env.read_text() == "API_TOKEN=sk-live-TOPSECRET\n")
 env.unlink()  # simulate keep_original=false: the plaintext is gone
 ctx.answer = "Deny"
 check("Deny -> nothing written", cmd("decrypt .env.svault") == "Decryption denied." and not env.exists())
 ctx.answer = "Approve"
 out = cmd("decrypt .env.svault")
-check("Approve -> file restored", env.read_text() == "API_TOKEN=***\n" and "plaintext on disk" in out)
+check("Approve -> file restored", env.read_text() == "API_TOKEN=sk-live-TOPSECRET\n" and "plaintext on disk" in out)
 env.write_text("newer content")
 out = cmd("decrypt .env.svault")
 check("never overwrites an existing file", "already exists" in out and env.read_text() == "newer content")
