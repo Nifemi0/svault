@@ -48,7 +48,9 @@ After `svault_protect_db`:
   DENIED to the agent. `/svault reveal` is a slash command; it asks
   `Approve / Deny` and anything other than an explicit `Approve` (deny, cancel,
   timeout) is a denial. It only runs from a local session (CLI, TUI, Desktop),
-  never from a messaging platform where the secret would land in a chat.
+  never from a messaging platform where the secret would land in a chat. The
+  revealed value is **written to a guard-protected outbox file, never returned
+  to the conversation**, so it cannot leak into the model's next turn.
 - **Whole-file vault too.** `svault_encrypt` locks any file (cookies, `.env`)
   into a `.svault` container, verifies the ciphertext decrypts, and then
   deletes the plaintext original (`keep_original: true` to keep it).
@@ -96,15 +98,18 @@ you   > /svault reveal database.json 504006010 solPrivateKey
 - **Plaintext that already escaped.** Older backups, git history and anything
   the agent read before protection still hold the secret. Rotate keys that were
   exposed. File deletion is a normal unlink, not a secure wipe.
-- **What you do with a revealed value.** The revealed value is returned to your
-  session as the command's output, and `/svault decrypt` puts plaintext back on
-  disk. Reveal only what you need, when you need it.
+- **What you do with a revealed value.** The value is written to
+  `<vault>/reveals/<record>.<field>.txt` — open it yourself and delete it when
+  done. It is never returned to the conversation, so it can't leak into the
+  model's context. `/svault decrypt` puts plaintext back on disk. Reveal only
+  what you need, when you need it.
 - **Windows file permissions.** Key files are created `0600` on POSIX; on
   Windows they rely on your user-profile ACLs.
 
-Set `SVAULT_GUARD=0` on the gateway to turn the guard off (for example while
-developing svault itself). Set `SVAULT_ALLOW_REMOTE_REVEAL=1` to allow
-`/svault reveal` from messaging platforms.
+Set the `guard` setting to `false` (config.yaml → `plugins.entries.svault.settings.guard`,
+or the Desktop plugin settings page) to turn the guard off while developing
+svault itself. Set `allow_remote_reveal` to `true` to allow `/svault reveal`
+from messaging platforms.
 
 ## Crypto
 

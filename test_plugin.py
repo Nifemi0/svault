@@ -150,16 +150,22 @@ check("Deny -> denied", cmd("reveal database.json 504006010 solPrivateKey") == "
 ctx.answer = None
 check("no answer (timeout/unanswerable) -> denied", cmd("reveal database.json 504006010 solPrivateKey") == "Reveal denied.")
 ctx.answer = "Approve"
+
+
+def revealed(record, field):
+    return (VAULT / "reveals" / f"{record}.{field}.txt").read_text()
+
+
 out = cmd("reveal database.json 504006010 solPrivateKey")
-check("Approve -> value revealed", out.endswith("= SECRETKEY_AAA"))
+check("Approve -> value written to outbox, not returned", "written to" in out and "SECRETKEY" not in out and "SECRETKEY_AAA" in revealed("504006010", "solPrivateKey"))
 out = cmd("reveal database.json 564622369 solPrivateKey --agent admin")
-check("nested secret round-trips", "SECRETKEY_NESTED" in out)
+check("nested secret round-trips via outbox", "SECRETKEY_NESTED" in revealed("564622369", "solPrivateKey"))
 check("not-encrypted field refused", cmd("reveal database.json 504006010 username").startswith("Reveal failed"))
 asked = len(ctx.asked)
 out = cmd("reveal database.json 504006010 solPrivateKey", platform="telegram")
 check("refused from a messaging platform", "only available from a local session" in out and "SECRETKEY" not in out)
 check("...without even prompting", len(ctx.asked) == asked)
-check("allowed from the CLI surface", cmd("reveal database.json 504006010 solPrivateKey", platform="cli").endswith("= SECRETKEY_AAA"))
+check("allowed from the CLI surface", "written to" in cmd("reveal database.json 504006010 solPrivateKey", platform="cli") and "SECRETKEY_AAA" in revealed("504006010", "solPrivateKey"))
 tampered = json.loads(raw)
 blob = tampered["504006010"]["solPrivateKey"]["__svault_enc__"]
 tampered["504006010"]["username"] = {"__svault_enc__": dict(blob)}

@@ -61,6 +61,16 @@ def _vault_dir() -> Path:
     return base
 
 
+def _reveal_dir() -> Path:
+    d = _vault_dir() / "reveals"
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
+    return d
+
+
 def _agents_dir() -> Path:
     return _vault_dir() / "agents"
 
@@ -640,7 +650,17 @@ def register(ctx):
                 val = db.reveal(data, record, field, agent, _load_agent_private(agent))
             except Exception as e:  # noqa: BLE001
                 return f"Reveal failed: {e}"
-            return f"Revealed {record}.{field} = {val}"
+            # Never return the secret to the conversation — a slash-command reply
+            # becomes part of the session the model reads next turn. Write it to a
+            # guard-protected outbox file the agent cannot read, and return only
+            # the path.
+            out = _reveal_dir() / f"{record}.{field}.txt"
+            crypto.atomic_write_bytes(out, f"{record}.{field} = {val}\n".encode("utf-8"))
+            return (
+                f"Revealed {record}.{field}. The value was written to {out} — it is "
+                "kept out of this conversation. Open the file yourself and delete it "
+                "when done; the agent cannot read that path."
+            )
 
         return (
             "Unknown svault subcommand. Try:\n"
