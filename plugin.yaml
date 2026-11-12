@@ -21,3 +21,14 @@ provides_tools:
   - svault_decrypt
   - svault_reveal
   - svault_list
+config_schema:
+  guard:
+    type: bool
+    default: true
+    label: "Key-directory guard"
+    description: "Block the agent's other tools from reading the key vault"
+  allow_remote_reveal:
+    type: bool
+    default: false
+    label: "Allow remote reveal"
+    description: "Allow /svault decrypt|reveal from messaging platforms"
