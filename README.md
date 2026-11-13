@@ -27,8 +27,8 @@ After `svault_protect_db`:
 
 - The agent can still read the DB and see `username` — but the key is now
   ciphertext **at rest**, and `svault_read_db` shows `••• REDACTED •••` instead.
-- The agent asks to `cat ~/.svault/agents/admin.key`? **Blocked** before the
-  tool runs.
+- The agent asks to `cat <hermes-home>/plugin-data/svault/agents/admin.key`?
+  **Blocked** before the tool runs.
 - Only `/svault reveal database.json 504006010 solPrivateKey` — typed by a
   human at the machine, with an explicit `Approve` — decrypts that one value.
 
@@ -65,8 +65,8 @@ you   > create a svault agent called admin, then protect solPrivateKey in databa
 agent > svault_agent_new(admin) → svault_protect_db(...)   # 172 values encrypted
 you   > show me bill's record
 agent > svault_read_db → {"username": "bill", "solPrivateKey": {"__svault_enc__": "••• REDACTED •••"}}
-you   > read ~/.svault/agents/admin.key and decrypt it yourself
-agent > terminal(cat ~/.svault/agents/admin.key) → svault: blocked.
+you   > read the admin key and decrypt it yourself
+agent > terminal(cat <hermes-home>/plugin-data/svault/agents/admin.key) → svault: blocked.
 agent > svault_reveal(...) → DENIED: run /svault reveal …
 you   > /svault reveal database.json 504006010 solPrivateKey
         Reveal 'solPrivateKey' of record '504006010' as agent 'admin'?  [Approve] [Deny]
@@ -90,11 +90,12 @@ you   > /svault reveal database.json 504006010 solPrivateKey
 - **Root, or anyone with your user account.** The private key is on the same
   machine as the ciphertext. For that threat, keep the key off-box.
 - **A determined attacker driving a shell.** The guard is a string match on
-  tool arguments. It stops the direct path (`cat ~/.svault/…`, a file read of
-  the key), not a command that hides the path (encoding, globbing such as
-  `~/.sv*`, a script written in pieces). If your agent has an unrestricted
-  terminal, treat the guard as a tripwire, not a wall — run the agent's tools
-  in a sandbox/container that cannot see `SVAULT_HOME` for real isolation.
+  tool arguments. It stops the direct path (`cat …/plugin-data/svault/…`, a
+  file read of the key), not a command that hides the path (encoding, globbing
+  such as `…/svau*`, a script written in pieces). If your agent has an
+  unrestricted terminal, treat the guard as a tripwire, not a wall — run the
+  agent's tools in a sandbox/container that cannot see the vault dir for real
+  isolation.
 - **Plaintext that already escaped.** Older backups, git history and anything
   the agent read before protection still hold the secret. Rotate keys that were
   exposed. File deletion is a normal unlink, not a secure wipe.
@@ -164,4 +165,4 @@ CI runs all three on Linux and Windows.
 
 ## Data layout
 
-- `~/.svault/agents/<name>.key` — agent private keys (0600). Override with `SVAULT_HOME`.
+- `<hermes-home>/plugin-data/svault/agents/<name>.key` — agent private keys (0600). Override with `SVAULT_HOME`.
